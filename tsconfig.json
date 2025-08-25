@@ -7,8 +7,7 @@
     "rootDir": "src",
     "strict": true,
     "esModuleInterop": true,
-    "skipLibCheck": true,
-    "preserveShebang": true
+    "skipLibCheck": true
   },
   "include": [
     "src/**/*"
