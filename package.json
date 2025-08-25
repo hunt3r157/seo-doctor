@@ -1,0 +1,49 @@
+{
+  "name": "seo-doctor",
+  "version": "0.1.0",
+  "description": "CLI to score SEO fundamentals with actionable fixes.",
+  "type": "module",
+  "bin": {
+    "seo-doctor": "dist/seo-doctor.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "ts-node src/seo-doctor.ts https://example.com --json out.json --md out.md",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "commander": "^12.1.0",
+    "undici": "^6.19.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.4"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "keywords": [
+    "seo",
+    "audit",
+    "cli",
+    "lighthouse",
+    "readme-doctor",
+    "score"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yourname/seo-doctor.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yourname/seo-doctor/issues"
+  },
+  "homepage": "https://github.com/yourname/seo-doctor#readme",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ]
+}
