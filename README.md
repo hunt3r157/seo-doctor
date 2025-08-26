@@ -6,6 +6,9 @@ A tiny, pragmatic CLI that audits a URL or a built site for **SEO fundamentals**
 
 [![npm version](https://img.shields.io/npm/v/seo-doctor.svg)](https://www.npmjs.com/package/seo-doctor)
 [![npm downloads](https://img.shields.io/npm/dm/seo-doctor.svg)](https://www.npmjs.com/package/seo-doctor)
+[![release](https://img.shields.io/github/actions/workflow/status/hunt3r157/seo-doctor/release.yml?branch=main&label=release)](https://github.com/hunt3r157/seo-doctor/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-Support-ff5e5b?logo=kofi&logoColor=white)](https://ko-fi.com/hunt3r157)
 
 ---
 
