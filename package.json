@@ -35,12 +35,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yourname/seo-doctor.git"
+    "url": "git+https://github.com/hunt3r157/seo-doctor.git"
   },
   "bugs": {
-    "url": "https://github.com/yourname/seo-doctor/issues"
+    "url": "https://github.com/hunt3r157/seo-doctor/issues"
   },
-  "homepage": "https://github.com/yourname/seo-doctor#readme",
+  "homepage": "https://github.com/hunt3r157/seo-doctor#readme",
   "files": [
     "dist",
     "README.md",
