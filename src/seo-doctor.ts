@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { writeFileSync, readFileSync, statSync, readdirSync } from 'fs';
+import { writeFileSync, readFileSync, statSync, readdirSync, existsSync } from 'fs';
 import { resolve, extname, join } from 'path';
 import * as cheerio from 'cheerio';
 import { request } from 'undici';
@@ -41,7 +41,7 @@ const CATEGORY_WEIGHTS: Record<CategoryId, number> = {
   structured: 0.10,
 };
 
-const VERSION = '0.1.0';
+const VERSION = '0.1.3';
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
@@ -55,7 +55,7 @@ async function fetchText(target: string, timeoutMs = 15000): Promise<{ status: n
   try {
     const res = await request(target, { method: 'GET', signal: controller.signal, headers: { 'user-agent': 'seo-doctor/0.1' } });
     const text = await res.body.text();
-    const finalUrl = target; // undici.request doesn't expose final URL directly
+    const finalUrl = target;
     return { status: res.statusCode, text, finalUrl };
   } finally {
     clearTimeout(timer);
@@ -82,17 +82,47 @@ function scoreRange(min: number, max: number, value: number): number {
   return 1;
 }
 
+function findLocalHtmlCandidate(): string | undefined {
+  const candidates = ['index.html', 'dist/index.html', 'build/index.html', 'public/index.html', 'out/index.html'];
+  for (const c of candidates) {
+    try {
+      const p = resolve(process.cwd(), c);
+      if (existsSync(p) && statSync(p).isFile()) return p;
+    } catch {}
+  }
+  try {
+    const files = readdirSync(process.cwd()).filter(f => f.endsWith('.html'));
+    if (files.length) return resolve(process.cwd(), files[0]);
+  } catch {}
+  return undefined;
+}
+
+function resolveDefaultTarget(input?: string): string {
+  if (input) return input;
+  const env = process.env.SEO_TARGET_URL;
+  if (env && env.trim()) return env.trim();
+  try {
+    const pkgPath = resolve(process.cwd(), 'package.json');
+    if (existsSync(pkgPath)) {
+      const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+      if (typeof pkg.homepage === 'string' && /^https?:\/\//i.test(pkg.homepage)) return pkg.homepage;
+    }
+  } catch {}
+  const local = findLocalHtmlCandidate();
+  if (local) return local;
+  return 'http://localhost:3000';
+}
+
 async function auditPage(pageUrl: string, html: string): Promise<PageAuditResult> {
   const $ = cheerio.load(html);
   const findings: Finding[] = [];
-
   const add = (f: Finding) => findings.push(f);
 
   // Metadata: title
   const title = $('head > title').first().text().trim();
   const titleLen = title.length;
   const titleScore = title ? scoreRange(15, 60, titleLen) : 0;
-  if (!title) add({ id: 'title-missing', title: 'Missing <title>', severity: 'error', score: 0, suggestion: 'Add a concise, keyword‑focused <title> (15–60 chars).', page: pageUrl });
+  if (!title) add({ id: 'title-missing', title: 'Missing <title>', severity: 'error', score: 0, suggestion: 'Add a concise, keyword-focused <title> (15–60 chars).', page: pageUrl });
   else if (titleScore < 1) add({ id: 'title-length', title: `Title length suboptimal (${titleLen})`, severity: 'warn', score: titleScore, suggestion: 'Aim for 15–60 characters with the primary keyword near the front.', page: pageUrl, evidence: { title } });
 
   // Metadata: description
@@ -154,15 +184,14 @@ async function auditPage(pageUrl: string, html: string): Promise<PageAuditResult
   let emptyAnchors = 0;
   anchors.each((_, el) => { const txt = $(el).text().trim(); if (!txt) emptyAnchors += 1; });
   const anchorScore = anchors.length ? (emptyAnchors === 0 ? 1 : emptyAnchors <= 2 ? 0.7 : 0.4) : 1;
-  if (emptyAnchors) add({ id: 'empty-anchors', title: `Links with empty text (${emptyAnchors})`, severity: 'info', score: anchorScore, suggestion: 'Use descriptive, non‑empty anchor text; avoid “click here.”', page: pageUrl });
+  if (emptyAnchors) add({ id: 'empty-anchors', title: `Links with empty text (${emptyAnchors})`, severity: 'info', score: anchorScore, suggestion: 'Use descriptive, non-empty anchor text; avoid “click here.”', page: pageUrl });
 
   // Discoverability: noindex
   const robotsMeta = $('meta[name="robots"]').attr('content')?.toLowerCase() ?? '';
   const noindex = robotsMeta.includes('noindex');
-  const noindexScore = noindex ? 0 : 1;
   if (noindex) add({ id: 'noindex-set', title: 'noindex is set', severity: 'error', score: 0, suggestion: 'Remove noindex for pages that should appear in search.', page: pageUrl, evidence: { robots: robotsMeta } });
 
-  // Structured data: JSON‑LD parse
+  // Structured data: JSON-LD parse
   let structuredScore = 0;
   const jsonLdBlocks: any[] = [];
   $('script[type="application/ld+json"]').each((_, el) => {
@@ -173,7 +202,7 @@ async function auditPage(pageUrl: string, html: string): Promise<PageAuditResult
     } catch {}
   });
   structuredScore = jsonLdBlocks.length ? 1 : 0;
-  if (!jsonLdBlocks.length) add({ id: 'jsonld-missing', title: 'No JSON‑LD structured data', severity: 'info', score: 0, suggestion: 'Add JSON‑LD (Organization, WebSite; Article/BlogPosting for posts).', page: pageUrl });
+  if (!jsonLdBlocks.length) add({ id: 'jsonld-missing', title: 'No JSON-LD structured data', severity: 'info', score: 0, suggestion: 'Add JSON-LD (Organization, WebSite; Article/BlogPosting for posts).', page: pageUrl });
 
   const cat: Record<CategoryId, number> = {
     metadata: Math.min(1, (titleScore + descScore + ogScore + (twitterCard ? 1 : 0)) / 4),
@@ -218,7 +247,7 @@ function toMarkdown(report: Report): string {
   lines.push('## Summary by Category');
   const prettyName: Record<CategoryId,string> = {
     discoverability: 'Discoverability',
-    semantics: 'On‑page semantics',
+    semantics: 'On-page semantics',
     metadata: 'Metadata',
     i18n_mobile: 'Internationalization & Mobile',
     structured: 'Structured data'
@@ -240,21 +269,7 @@ function toMarkdown(report: Report): string {
   return lines.join('\n');
 }
 
-async function main() {
-  const program = new Command();
-  program
-    .argument('<target>', 'URL, HTML file, or directory of HTML')
-    .option('--crawl', 'crawl same‑origin links', false)
-    .option('--max-pages <n>', 'max pages to crawl', (v) => parseInt(v,10), 10)
-    .option('--json <file>', 'write JSON report')
-    .option('--md <file>', 'write Markdown report')
-    .option('--fail-under <score>', 'exit non‑zero if score below', (v)=>parseInt(v,10), 0)
-    .option('--timeout <ms>', 'request timeout', (v)=>parseInt(v,10), 15000)
-    .parse(process.argv);
-
-  const opts = program.opts();
-  const target = normalizeUrl(program.args[0]);
-
+async function runAudit(target: string, opts: any) {
   const pages: string[] = [];
 
   if (/^https?:\/\//i.test(target)) {
@@ -263,11 +278,11 @@ async function main() {
     } else {
       const toVisit = [target];
       const seen = new Set<string>();
-      while (toVisit.length && pages.length < opts.maxPages) {
+      while (toVisit.length && pages.length < (opts.maxPages ?? 10)) {
         const next = toVisit.shift()!;
         if (seen.has(next)) continue; seen.add(next);
         try {
-          const { status, text, finalUrl } = await fetchText(next, opts.timeout);
+          const { status, text, finalUrl } = await fetchText(next, opts.timeout ?? 15000);
           if (status >= 200 && status < 400) {
             pages.push(finalUrl);
             const $ = cheerio.load(text);
@@ -304,7 +319,7 @@ async function main() {
   let robotsOk = 1, sitemapOk = 1, robotsEvidence: any = {}, sitemapEvidence: any = {};
   if (/^https?:\/\//i.test(target)) {
     try {
-      const r = await checkRobotsAndSitemap(target, opts.timeout);
+      const r = await checkRobotsAndSitemap(target, opts.timeout ?? 15000);
       robotsOk = r.robotsOk; sitemapOk = r.sitemapOk; robotsEvidence = r.robotsEvidence; sitemapEvidence = r.sitemapEvidence;
     } catch {}
   }
@@ -315,7 +330,7 @@ async function main() {
   for (const p of pages) {
     let html = pageContent.get(p);
     if (!html) {
-      try { const res = await fetchText(p, opts.timeout); html = res.text; } catch { html = ''; }
+      try { const res = await fetchText(p, opts.timeout ?? 15000); html = res.text; } catch { html = ''; }
     }
     const result = await auditPage(p, html || '');
     perPage.push(result);
@@ -364,7 +379,7 @@ async function main() {
 
   const order: [CategoryId, string][] = [
     ['discoverability', 'Discoverability'],
-    ['semantics', 'On‑page semantics'],
+    ['semantics', 'On-page semantics'],
     ['metadata', 'Metadata'],
     ['i18n_mobile', 'I18n & Mobile'],
     ['structured', 'Structured data'],
@@ -389,8 +404,42 @@ async function main() {
 }
 
 const pageContent = new Map<string,string>();
-
 function round2(n: number) { return Math.round(n*100)/100; }
 function round0(n: number) { return Math.round(n); }
 
-main().catch(err => { console.error(err); process.exit(2); });
+// ---------- CLI ----------
+const program = new Command();
+program
+  .name('seo-doctor')
+  .description('Score SEO fundamentals with actionable fixes')
+  .version(VERSION);
+
+// Root command (back-compat): seo-doctor [target]
+program
+  .argument('[target]', 'URL, HTML file, or directory of HTML')
+  .option('--crawl', 'crawl same-origin links', false)
+  .option('--max-pages <n>', 'max pages to crawl', (v) => parseInt(v,10), 10)
+  .option('--json <file>', 'write JSON report')
+  .option('--md <file>', 'write Markdown report')
+  .option('--fail-under <score>', 'exit non-zero if score below', (v)=>parseInt(v,10), 0)
+  .option('--timeout <ms>', 'request timeout', (v)=>parseInt(v,10), 15000)
+  .action(async (target, opts) => {
+    const resolved = resolveDefaultTarget(target);
+    await runAudit(normalizeUrl(resolved), opts);
+  });
+
+// Subcommand: seo-doctor check [target]
+program.command('check')
+  .argument('[target]', 'URL, HTML file, or directory of HTML (optional)')
+  .option('--crawl', 'crawl same-origin links', false)
+  .option('--max-pages <n>', 'max pages to crawl', (v) => parseInt(v,10), 10)
+  .option('--json <file>', 'write JSON report')
+  .option('--md <file>', 'write Markdown report')
+  .option('--fail-under <score>', 'exit non-zero if score below', (v)=>parseInt(v,10), 0)
+  .option('--timeout <ms>', 'request timeout', (v)=>parseInt(v,10), 15000)
+  .action(async (target, opts) => {
+    const resolved = resolveDefaultTarget(target);
+    await runAudit(normalizeUrl(resolved), opts);
+  });
+
+program.parseAsync(process.argv).catch(err => { console.error(err); process.exit(2); });
