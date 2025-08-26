@@ -1,60 +1,71 @@
-name: SEO Doctor
+name: release
+
 on:
-  pull_request:
+  # fires when you click "Publish release" in GitHub UI
+  release:
+    types: [published]
+  # and/or if you push a v* tag directly
   push:
-    branches: [ main ]
-    tags-ignore:
-      - 'v*'  # don't run on release tag pushes
+    tags: ['v*']
+  # manual button
+  workflow_dispatch: {}
 
 jobs:
-  audit:
+  publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # for GitHub Release notes (safe)
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # we need tags
+
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Derive tag & version
+        id: meta
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME:-$(git describe --tags --abbrev=0)}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          echo "pkg=${PKG_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Tag: $TAG  Package: v$PKG_VERSION"
+
+      - name: Verify tag matches package.json version (vX.Y.Z)
+        run: |
+          if [ "v${{ steps.meta.outputs.pkg }}" != "${{ steps.meta.outputs.tag }}" ]; then
+            echo "Tag ${{ steps.meta.outputs.tag }} != v${{ steps.meta.outputs.pkg }}"
+            exit 1
+          fi
 
       - run: npm ci
       - run: npm run build
 
-      - name: Determine target
-        id: target
-        shell: bash
-        run: |
-          if [ -n "${{ secrets.SEO_TARGET_URL }}" ]; then
-            echo "url=${{ secrets.SEO_TARGET_URL }}" >> "$GITHUB_OUTPUT"
-            echo "skip_gate=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "No SEO_TARGET_URL secret; using placeholder and skipping gating."
-            echo "url=https://example.com" >> "$GITHUB_OUTPUT"
-            echo "skip_gate=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Run SEO Doctor (gated)
-        if: steps.target.outputs.skip_gate == 'false'
-        env:
-          TARGET_URL: ${{ steps.target.outputs.url }}
-        run: |
-          node dist/seo-doctor.js "$TARGET_URL" \
-            --json seo-report.json --md seo-report.md \
-            --fail-under 60
-
-      - name: Run SEO Doctor (non-gated placeholder)
-        if: steps.target.outputs.skip_gate == 'true'
-        env:
-          TARGET_URL: ${{ steps.target.outputs.url }}
-        run: |
-          node dist/seo-doctor.js "$TARGET_URL" \
-            --json seo-report.json --md seo-report.md
+      - name: Skip if version already on npm
+        id: exists
         continue-on-error: true
+        run: npm view seo-doctor@${{ steps.meta.outputs.pkg }} version
 
-      - name: Upload report
-        if: always()
-        uses: actions/upload-artifact@v4
+      - name: Auth npm
+        if: steps.exists.outcome == 'failure'  # only if not already published
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+          npm config set always-auth=true
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish to npm
+        if: steps.exists.outcome == 'failure'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
+
+      - name: Create GitHub Release (notes)
+        uses: softprops/action-gh-release@v2
         with:
-          name: seo-report
-          path: |
-            seo-report.json
-            seo-report.md
+          generate_release_notes: true
