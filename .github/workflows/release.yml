@@ -1,0 +1,59 @@
+name: release
+
+on:
+  release:
+    types: [published]          # when you click "Publish release"
+  push:
+    tags: ['v*']                # or when you push a vX.Y.Z tag
+  workflow_dispatch: {}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write           # for creating GH Releases (notes)
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # we need tags for version derivation
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'  # setup-node wires npm to this registry
+
+      - name: Derive tag & version
+        id: meta
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME:-$(git describe --tags --abbrev=0)}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          echo "pkg=${PKG_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Tag: $TAG  Package: v$PKG_VERSION"
+
+      - name: Verify tag matches package.json version
+        run: |
+          test "v${{ steps.meta.outputs.pkg }}" = "${{ steps.meta.outputs.tag }}" \
+            || (echo "Tag ${{ steps.meta.outputs.tag }} != v${{ steps.meta.outputs.pkg }}" && exit 1)
+
+      - run: npm ci
+      - run: npm run build
+
+      # Skip if already published (idempotent)
+      - name: Check if version exists on npm
+        id: exists
+        continue-on-error: true
+        run: npm view seo-doctor@${{ steps.meta.outputs.pkg }} version
+
+      - name: Publish to npm
+        if: steps.exists.outcome == 'failure'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}   # <-- only this is needed
+        run: npm publish --access public
+
+      - name: Create GitHub Release (notes)
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
