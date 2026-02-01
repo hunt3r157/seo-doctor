@@ -13,7 +13,9 @@
   },
   "dependencies": {
     "cheerio": "^1.0.0",
+    "chrome-launcher": "^1.2.1",
     "commander": "^12.1.0",
+    "lighthouse": "^13.0.1",
     "playwright": "^1.58.1",
     "robots-parser": "^3.0.1",
     "undici": "^6.19.8"

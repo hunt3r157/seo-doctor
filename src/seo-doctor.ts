@@ -7,6 +7,8 @@ import { request } from 'undici';
 import * as url from 'url';
 import robotsParser from 'robots-parser';
 import { chromium } from 'playwright';
+import lighthouse from 'lighthouse';
+import * as chromeLauncher from 'chrome-launcher';
 
 type Finding = {
   id: string;
@@ -18,7 +20,7 @@ type Finding = {
   page: string;
 };
 
-type CategoryId = 'discoverability' | 'semantics' | 'metadata' | 'i18n_mobile' | 'structured';
+type CategoryId = 'discoverability' | 'semantics' | 'metadata' | 'i18n_mobile' | 'structured' | 'performance';
 
 interface PageAuditResult {
   url: string;
@@ -36,14 +38,15 @@ interface Report {
 }
 
 const CATEGORY_WEIGHTS: Record<CategoryId, number> = {
-  discoverability: 0.25,
-  semantics: 0.25,
-  metadata: 0.25,
+  discoverability: 0.20,
+  semantics: 0.20,
+  metadata: 0.20,
   i18n_mobile: 0.15,
   structured: 0.10,
+  performance: 0.15,
 };
 
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
@@ -55,7 +58,7 @@ async function fetchText(target: string, timeoutMs = 15000): Promise<{ status: n
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await request(target, { method: 'GET', signal: controller.signal, headers: { 'user-agent': 'seo-doctor/0.3' } });
+    const res = await request(target, { method: 'GET', signal: controller.signal, headers: { 'user-agent': 'seo-doctor/0.4' } });
     const text = await res.body.text();
     const finalUrl = target; 
     return { status: res.statusCode, text, finalUrl };
@@ -70,7 +73,7 @@ async function fetchRendered(target: string, timeoutMs = 30000): Promise<{ statu
   let browser;
   try {
     browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext({ userAgent: 'seo-doctor/0.3 (Playwright)' });
+    const context = await browser.newContext({ userAgent: 'seo-doctor/0.4 (Playwright)' });
     const page = await context.newPage();
     
     const response = await page.goto(target, { timeout: timeoutMs, waitUntil: 'networkidle' });
@@ -86,6 +89,58 @@ async function fetchRendered(target: string, timeoutMs = 30000): Promise<{ statu
   }
 }
 
+async function runLighthouse(url: string): Promise<{ score: number, findings: Finding[] }> {
+    let chrome;
+    try {
+        chrome = await chromeLauncher.launch({chromeFlags: ['--headless']});
+        const options = {logLevel: 'error', output: 'json', onlyCategories: ['performance'], port: chrome.port};
+        // @ts-ignore
+        const runnerResult = await lighthouse(url, options);
+        if (!runnerResult) throw new Error('Lighthouse failed');
+        const report = runnerResult.lhr;
+
+        const score = report.categories.performance.score || 0;
+        const findings: Finding[] = [];
+
+        // Extract Vitals
+        const lcp = report.audits['largest-contentful-paint'];
+        const cls = report.audits['cumulative-layout-shift'];
+        const inp = report.audits['interaction-to-next-paint']; // Lighthouse uses max-potential-fid or similar if INP not full field data, but we check what's avail
+
+        if (lcp && lcp.score !== null && lcp.score < 0.9) {
+             findings.push({ 
+                 id: 'lcp-poor', 
+                 title: `Poor LCP (${lcp.displayValue})`, 
+                 severity: lcp.score < 0.5 ? 'error' : 'warn', 
+                 score: lcp.score, 
+                 suggestion: 'Optimize Largest Contentful Paint (images, server response time).', 
+                 page: url,
+                 evidence: { value: lcp.numericValue }
+            });
+        }
+
+        if (cls && cls.score !== null && cls.score < 0.9) {
+            findings.push({ 
+                id: 'cls-poor', 
+                title: `Poor CLS (${cls.displayValue})`, 
+                severity: cls.score < 0.5 ? 'error' : 'warn', 
+                score: cls.score, 
+                suggestion: 'Reduce layout shifts (specify image dims, avoid top-injected content).', 
+                page: url,
+                evidence: { value: cls.numericValue }
+           });
+       }
+
+       return { score, findings };
+
+    } catch (e) {
+        if (chrome) await chrome.kill();
+        return { score: 0, findings: [{id: 'lighthouse-fail', title: 'Lighthouse failed to run', severity: 'info', score: 0, page: url, suggestion: 'Ensure Chrome is installed or retry.'}] };
+    } finally {
+        if (chrome) await chrome.kill();
+    }
+}
+
 async function checkLinkStatus(link: string, timeoutMs = 5000): Promise<number> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -93,7 +148,7 @@ async function checkLinkStatus(link: string, timeoutMs = 5000): Promise<number> 
     const res = await request(link, { 
       method: 'HEAD', 
       signal: controller.signal, 
-      headers: { 'user-agent': 'seo-doctor/0.3' },
+      headers: { 'user-agent': 'seo-doctor/0.4' },
       maxRedirections: 3
     });
     return res.statusCode;
@@ -102,7 +157,7 @@ async function checkLinkStatus(link: string, timeoutMs = 5000): Promise<number> 
         const res = await request(link, { 
             method: 'GET', 
             signal: controller.signal, 
-            headers: { 'user-agent': 'seo-doctor/0.3' },
+            headers: { 'user-agent': 'seo-doctor/0.4' },
             maxRedirections: 3
           });
           return res.statusCode;
@@ -305,6 +360,10 @@ async function auditPage(pageUrl: string, html: string, opts: any, robots?: any)
   if (!jsonLdBlocks.length) add({ id: 'jsonld-missing', title: 'No JSON-LD structured data', severity: 'info', score: 0, suggestion: 'Add JSON-LD (Organization, WebSite; Article/BlogPosting for posts).', page: pageUrl });
   else if (validSchemas === 0) add({ id: 'jsonld-invalid', title: 'Invalid JSON-LD Schema', severity: 'warn', score: 0.5, suggestion: 'Ensure @context is "https://schema.org" and @type is present.', page: pageUrl });
 
+  // Performance (Placeholder for standard audit, actual LH run happens in loop)
+  // We initialize performance score to 1 if not running LH, or 0 if we are and waiting for result
+  let perfScore = opts.lighthouse ? 0 : 1; 
+
 
   const cat: Record<CategoryId, number> = {
     metadata: Math.min(1, (titleScore + descScore + ogScore + (twitterCard ? 1 : 0)) / 4),
@@ -312,6 +371,7 @@ async function auditPage(pageUrl: string, html: string, opts: any, robots?: any)
     semantics: Math.min(1, (headingScore + imgAltScore + anchorScore) / 3),
     i18n_mobile: i18nScore,
     structured: structuredScore,
+    performance: perfScore
   };
 
   return { url: pageUrl, categoryScores: cat, findings };
@@ -356,7 +416,8 @@ function toMarkdown(report: Report): string {
     semantics: 'On-page semantics',
     metadata: 'Metadata',
     i18n_mobile: 'Internationalization & Mobile',
-    structured: 'Structured data'
+    structured: 'Structured data',
+    performance: 'Performance (Core Web Vitals)'
   };
   (Object.keys(report.categories) as CategoryId[]).forEach((k) => {
     const c = report.categories[k];
@@ -451,13 +512,27 @@ async function runAudit(target: string, opts: any) {
       } catch { html = ''; }
     }
     const result = await auditPage(p, html || '', opts, robotsParserInstance);
+
+    // Run Lighthouse if requested (only on the first page to save time/resources for now, or per page if robust)
+    // For MVP CLI, running full lighthouse on every page of a crawl is too slow. Let's do it for the *first* page (target).
+    if (opts.lighthouse && p === pages[0] && /^https?:\/\//i.test(p)) {
+        console.log('Running Lighthouse audit on ' + p + '...');
+        const lh = await runLighthouse(p);
+        result.categoryScores.performance = lh.score;
+        result.findings.push(...lh.findings);
+    } else if (opts.lighthouse) {
+         // inherit score from first page or set to 1 (neutral) for subpages to avoid skewing if we only checked one
+         // simpler: just default to 1 if not checked
+         result.categoryScores.performance = 1;
+    }
+
     perPage.push(result);
     findings.push(...result.findings);
   }
 
-  const sumCat: Record<CategoryId, number> = { discoverability: 0, semantics: 0, metadata: 0, i18n_mobile: 0, structured: 0 };
+  const sumCat: Record<CategoryId, number> = { discoverability: 0, semantics: 0, metadata: 0, i18n_mobile: 0, structured: 0, performance: 0 };
   for (const r of perPage) for (const k of Object.keys(sumCat) as CategoryId[]) sumCat[k] += r.categoryScores[k];
-  const avgCat: Record<CategoryId, number> = { discoverability: 0, semantics: 0, metadata: 0, i18n_mobile: 0, structured: 0 };
+  const avgCat: Record<CategoryId, number> = { discoverability: 0, semantics: 0, metadata: 0, i18n_mobile: 0, structured: 0, performance: 0 };
   for (const k of Object.keys(sumCat) as CategoryId[]) avgCat[k] = sumCat[k] / perPage.length;
 
   if (/^https?:\/\//i.test(target)) {
@@ -472,6 +547,7 @@ async function runAudit(target: string, opts: any) {
     metadata: { score: round2(avgCat.metadata), weight: CATEGORY_WEIGHTS.metadata },
     i18n_mobile: { score: round2(avgCat.i18n_mobile), weight: CATEGORY_WEIGHTS.i18n_mobile },
     structured: { score: round2(avgCat.structured), weight: CATEGORY_WEIGHTS.structured },
+    performance: { score: round2(avgCat.performance), weight: CATEGORY_WEIGHTS.performance },
   };
 
   const overall = round0(100 * (
@@ -479,7 +555,8 @@ async function runAudit(target: string, opts: any) {
     categories.semantics.score * categories.semantics.weight +
     categories.metadata.score * categories.metadata.weight +
     categories.i18n_mobile.score * categories.i18n_mobile.weight +
-    categories.structured.score * categories.structured.weight
+    categories.structured.score * categories.structured.weight +
+    categories.performance.score * categories.performance.weight
   ));
 
   const report: Report = {
@@ -501,6 +578,7 @@ async function runAudit(target: string, opts: any) {
     ['metadata', 'Metadata'],
     ['i18n_mobile', 'I18n & Mobile'],
     ['structured', 'Structured data'],
+    ['performance', 'Performance (Core Web Vitals)'],
   ];
   for (const [id, label] of order) {
     const c = report.categories[id];
@@ -543,6 +621,7 @@ program
   .option('--timeout <ms>', 'request timeout', (v)=>parseInt(v,10), 15000)
   .option('--check-links', 'check for broken links (slow)', false)
   .option('--render', 'render pages with JS (Playwright) - slower but accurate for SPAs', false)
+  .option('--lighthouse', 'run Lighthouse for Core Web Vitals (slow, requires Chrome)', false)
   .action(async (target, opts) => {
     const resolved = resolveDefaultTarget(target);
     await runAudit(normalizeUrl(resolved), opts);
@@ -559,6 +638,7 @@ program.command('check')
   .option('--timeout <ms>', 'request timeout', (v)=>parseInt(v,10), 15000)
   .option('--check-links', 'check for broken links (slow)', false)
   .option('--render', 'render pages with JS (Playwright) - slower but accurate for SPAs', false)
+  .option('--lighthouse', 'run Lighthouse for Core Web Vitals (slow, requires Chrome)', false)
   .action(async (target, opts) => {
     const resolved = resolveDefaultTarget(target);
     await runAudit(normalizeUrl(resolved), opts);
