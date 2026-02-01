@@ -5,6 +5,7 @@ import { resolve, extname, join } from 'path';
 import * as cheerio from 'cheerio';
 import { request } from 'undici';
 import * as url from 'url';
+import robotsParser from 'robots-parser';
 
 type Finding = {
   id: string;
@@ -41,7 +42,7 @@ const CATEGORY_WEIGHTS: Record<CategoryId, number> = {
   structured: 0.10,
 };
 
-const VERSION = '0.1.3';
+const VERSION = '0.2.0';
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
@@ -53,10 +54,41 @@ async function fetchText(target: string, timeoutMs = 15000): Promise<{ status: n
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await request(target, { method: 'GET', signal: controller.signal, headers: { 'user-agent': 'seo-doctor/0.1' } });
+    const res = await request(target, { method: 'GET', signal: controller.signal, headers: { 'user-agent': 'seo-doctor/0.2' } });
     const text = await res.body.text();
-    const finalUrl = target;
+    const finalUrl = target; // undici request doesn't expose finalUrl easily without handling redirects manually, simplified for now
     return { status: res.statusCode, text, finalUrl };
+  } catch (e) {
+    return { status: 0, text: '', finalUrl: target };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function checkLinkStatus(link: string, timeoutMs = 5000): Promise<number> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await request(link, { 
+      method: 'HEAD', 
+      signal: controller.signal, 
+      headers: { 'user-agent': 'seo-doctor/0.2' },
+      maxRedirections: 3
+    });
+    return res.statusCode;
+  } catch {
+    // Fallback to GET if HEAD fails (some servers deny HEAD)
+    try {
+        const res = await request(link, { 
+            method: 'GET', 
+            signal: controller.signal, 
+            headers: { 'user-agent': 'seo-doctor/0.2' },
+            maxRedirections: 3
+          });
+          return res.statusCode;
+    } catch {
+        return 0;
+    }
   } finally {
     clearTimeout(timer);
   }
@@ -113,7 +145,7 @@ function resolveDefaultTarget(input?: string): string {
   return 'http://localhost:3000';
 }
 
-async function auditPage(pageUrl: string, html: string): Promise<PageAuditResult> {
+async function auditPage(pageUrl: string, html: string, opts: any, robots?: any): Promise<PageAuditResult> {
   const $ = cheerio.load(html);
   const findings: Finding[] = [];
   const add = (f: Finding) => findings.push(f);
@@ -156,6 +188,16 @@ async function auditPage(pageUrl: string, html: string): Promise<PageAuditResult
     }
   }
 
+  // Discoverability: robots.txt check (real parsing)
+  if (robots && /^https?:\/\//i.test(pageUrl)) {
+      const isAllowed = robots.isAllowed(pageUrl, 'seo-doctor'); // Use our UA or *
+      if (isAllowed === false) {
+          add({ id: 'blocked-by-robots', title: 'Blocked by robots.txt', severity: 'error', score: 0, suggestion: 'Update robots.txt to allow this URL if it should be indexed.', page: pageUrl });
+      } else if (isAllowed === undefined) {
+         // Undefined usually means error parsing or no rules, assume allowed
+      }
+  }
+
   // I18n & mobile
   const lang = $('html').attr('lang');
   const viewport = $('meta[name="viewport"]').attr('content');
@@ -179,19 +221,46 @@ async function auditPage(pageUrl: string, html: string): Promise<PageAuditResult
   const imgAltScore = totalImgs ? (missingPct <= 0.1 ? 1 : missingPct <= 0.3 ? 0.6 : 0.2) : 1;
   if (missingAlt) add({ id: 'img-alt-missing', title: `Images missing alt (${Math.round(missingPct*100)}%)`, severity: missingPct > 0.3 ? 'warn' : 'info', score: imgAltScore, suggestion: `Add alt to ~${missingAlt}/${totalImgs} images (decorative images may use alt="").`, page: pageUrl });
 
-  // Semantics: anchor text quality
+  // Semantics: anchor text quality & broken links
   const anchors = $('a[href]');
   let emptyAnchors = 0;
-  anchors.each((_, el) => { const txt = $(el).text().trim(); if (!txt) emptyAnchors += 1; });
+  const uniqueLinks = new Set<string>();
+  
+  anchors.each((_, el) => { 
+      const txt = $(el).text().trim(); 
+      if (!txt) emptyAnchors += 1; 
+      
+      const href = $(el).attr('href');
+      if (href && !href.startsWith('#') && !href.startsWith('mailto:') && !href.startsWith('tel:')) {
+          try {
+             const abs = new url.URL(href, pageUrl).toString();
+             uniqueLinks.add(abs);
+          } catch {}
+      }
+  });
+
   const anchorScore = anchors.length ? (emptyAnchors === 0 ? 1 : emptyAnchors <= 2 ? 0.7 : 0.4) : 1;
   if (emptyAnchors) add({ id: 'empty-anchors', title: `Links with empty text (${emptyAnchors})`, severity: 'info', score: anchorScore, suggestion: 'Use descriptive, non-empty anchor text; avoid “click here.”', page: pageUrl });
+
+  // Broken Link Checker (Limited to first 20 to save time/bandwidth for now)
+  let brokenLinks = 0;
+  if (opts.checkLinks) {
+      const linksToCheck = Array.from(uniqueLinks).slice(0, 20);
+      for (const l of linksToCheck) {
+         const status = await checkLinkStatus(l);
+         if (status >= 400 || status === 0) {
+             brokenLinks++;
+             add({ id: 'broken-link', title: `Broken link found: ${status || 'Error'}`, severity: 'error', score: 0, suggestion: `Fix broken link: ${l}`, page: pageUrl, evidence: { url: l, status } });
+         }
+      }
+  }
 
   // Discoverability: noindex
   const robotsMeta = $('meta[name="robots"]').attr('content')?.toLowerCase() ?? '';
   const noindex = robotsMeta.includes('noindex');
   if (noindex) add({ id: 'noindex-set', title: 'noindex is set', severity: 'error', score: 0, suggestion: 'Remove noindex for pages that should appear in search.', page: pageUrl, evidence: { robots: robotsMeta } });
 
-  // Structured data: JSON-LD parse
+  // Structured data: JSON-LD parse & validate
   let structuredScore = 0;
   const jsonLdBlocks: any[] = [];
   $('script[type="application/ld+json"]').each((_, el) => {
@@ -201,8 +270,23 @@ async function auditPage(pageUrl: string, html: string): Promise<PageAuditResult
       jsonLdBlocks.push(parsed);
     } catch {}
   });
-  structuredScore = jsonLdBlocks.length ? 1 : 0;
+
+  // Schema Validation
+  let validSchemas = 0;
+  if (jsonLdBlocks.length > 0) {
+      for (const block of jsonLdBlocks) {
+          const context = block['@context'];
+          const type = block['@type'];
+          if (context && (context.includes('schema.org') || context.includes('google.com/schemas'))) {
+             if (type) validSchemas++;
+          }
+      }
+      structuredScore = validSchemas > 0 ? 1 : 0.5; // Has JSON but maybe invalid schema
+  }
+
   if (!jsonLdBlocks.length) add({ id: 'jsonld-missing', title: 'No JSON-LD structured data', severity: 'info', score: 0, suggestion: 'Add JSON-LD (Organization, WebSite; Article/BlogPosting for posts).', page: pageUrl });
+  else if (validSchemas === 0) add({ id: 'jsonld-invalid', title: 'Invalid JSON-LD Schema', severity: 'warn', score: 0.5, suggestion: 'Ensure @context is "https://schema.org" and @type is present.', page: pageUrl });
+
 
   const cat: Record<CategoryId, number> = {
     metadata: Math.min(1, (titleScore + descScore + ogScore + (twitterCard ? 1 : 0)) / 4),
@@ -218,12 +302,16 @@ async function auditPage(pageUrl: string, html: string): Promise<PageAuditResult
 async function checkRobotsAndSitemap(root: string, timeoutMs: number) {
   const origin = new url.URL(root).origin;
   let robotsOk = 0, sitemapOk = 0, robotsEvidence: any = {}, sitemapEvidence: any = {};
+  let robotsObj: any = null;
 
   try {
     const robotsUrl = origin + '/robots.txt';
     const r = await fetchText(robotsUrl, timeoutMs);
     robotsOk = r.status >= 200 && r.status < 400 ? 1 : 0;
     robotsEvidence = { url: robotsUrl, status: r.status };
+    if (robotsOk) {
+        robotsObj = robotsParser(robotsUrl, r.text);
+    }
   } catch { robotsOk = 0; }
 
   try {
@@ -233,7 +321,7 @@ async function checkRobotsAndSitemap(root: string, timeoutMs: number) {
     sitemapEvidence = { url: smUrl, status: s.status };
   } catch { sitemapOk = 0; }
 
-  return { robotsOk, sitemapOk, robotsEvidence, sitemapEvidence };
+  return { robotsOk, sitemapOk, robotsEvidence, sitemapEvidence, robotsObj };
 }
 
 function toMarkdown(report: Report): string {
@@ -317,10 +405,13 @@ async function runAudit(target: string, opts: any) {
   }
 
   let robotsOk = 1, sitemapOk = 1, robotsEvidence: any = {}, sitemapEvidence: any = {};
+  let robotsParserInstance: any = null;
+
   if (/^https?:\/\//i.test(target)) {
     try {
       const r = await checkRobotsAndSitemap(target, opts.timeout ?? 15000);
       robotsOk = r.robotsOk; sitemapOk = r.sitemapOk; robotsEvidence = r.robotsEvidence; sitemapEvidence = r.sitemapEvidence;
+      robotsParserInstance = r.robotsObj;
     } catch {}
   }
 
@@ -332,7 +423,7 @@ async function runAudit(target: string, opts: any) {
     if (!html) {
       try { const res = await fetchText(p, opts.timeout ?? 15000); html = res.text; } catch { html = ''; }
     }
-    const result = await auditPage(p, html || '');
+    const result = await auditPage(p, html || '', opts, robotsParserInstance);
     perPage.push(result);
     findings.push(...result.findings);
   }
@@ -423,6 +514,7 @@ program
   .option('--md <file>', 'write Markdown report')
   .option('--fail-under <score>', 'exit non-zero if score below', (v)=>parseInt(v,10), 0)
   .option('--timeout <ms>', 'request timeout', (v)=>parseInt(v,10), 15000)
+  .option('--check-links', 'check for broken links (slow)', false)
   .action(async (target, opts) => {
     const resolved = resolveDefaultTarget(target);
     await runAudit(normalizeUrl(resolved), opts);
@@ -437,6 +529,7 @@ program.command('check')
   .option('--md <file>', 'write Markdown report')
   .option('--fail-under <score>', 'exit non-zero if score below', (v)=>parseInt(v,10), 0)
   .option('--timeout <ms>', 'request timeout', (v)=>parseInt(v,10), 15000)
+  .option('--check-links', 'check for broken links (slow)', false)
   .action(async (target, opts) => {
     const resolved = resolveDefaultTarget(target);
     await runAudit(normalizeUrl(resolved), opts);
