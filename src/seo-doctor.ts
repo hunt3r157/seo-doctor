@@ -6,6 +6,7 @@ import * as cheerio from 'cheerio';
 import { request } from 'undici';
 import * as url from 'url';
 import robotsParser from 'robots-parser';
+import { chromium } from 'playwright';
 
 type Finding = {
   id: string;
@@ -42,7 +43,7 @@ const CATEGORY_WEIGHTS: Record<CategoryId, number> = {
   structured: 0.10,
 };
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
@@ -54,14 +55,34 @@ async function fetchText(target: string, timeoutMs = 15000): Promise<{ status: n
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await request(target, { method: 'GET', signal: controller.signal, headers: { 'user-agent': 'seo-doctor/0.2' } });
+    const res = await request(target, { method: 'GET', signal: controller.signal, headers: { 'user-agent': 'seo-doctor/0.3' } });
     const text = await res.body.text();
-    const finalUrl = target; // undici request doesn't expose finalUrl easily without handling redirects manually, simplified for now
+    const finalUrl = target; 
     return { status: res.statusCode, text, finalUrl };
   } catch (e) {
     return { status: 0, text: '', finalUrl: target };
   } finally {
     clearTimeout(timer);
+  }
+}
+
+async function fetchRendered(target: string, timeoutMs = 30000): Promise<{ status: number; text: string; finalUrl: string }> {
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({ userAgent: 'seo-doctor/0.3 (Playwright)' });
+    const page = await context.newPage();
+    
+    const response = await page.goto(target, { timeout: timeoutMs, waitUntil: 'networkidle' });
+    const text = await page.content();
+    const status = response?.status() ?? 0;
+    const finalUrl = page.url();
+    
+    await browser.close();
+    return { status, text, finalUrl };
+  } catch (e) {
+    if (browser) await browser.close();
+    return { status: 0, text: '', finalUrl: target };
   }
 }
 
@@ -72,17 +93,16 @@ async function checkLinkStatus(link: string, timeoutMs = 5000): Promise<number> 
     const res = await request(link, { 
       method: 'HEAD', 
       signal: controller.signal, 
-      headers: { 'user-agent': 'seo-doctor/0.2' },
+      headers: { 'user-agent': 'seo-doctor/0.3' },
       maxRedirections: 3
     });
     return res.statusCode;
   } catch {
-    // Fallback to GET if HEAD fails (some servers deny HEAD)
     try {
         const res = await request(link, { 
             method: 'GET', 
             signal: controller.signal, 
-            headers: { 'user-agent': 'seo-doctor/0.2' },
+            headers: { 'user-agent': 'seo-doctor/0.3' },
             maxRedirections: 3
           });
           return res.statusCode;
@@ -193,8 +213,6 @@ async function auditPage(pageUrl: string, html: string, opts: any, robots?: any)
       const isAllowed = robots.isAllowed(pageUrl, 'seo-doctor'); // Use our UA or *
       if (isAllowed === false) {
           add({ id: 'blocked-by-robots', title: 'Blocked by robots.txt', severity: 'error', score: 0, suggestion: 'Update robots.txt to allow this URL if it should be indexed.', page: pageUrl });
-      } else if (isAllowed === undefined) {
-         // Undefined usually means error parsing or no rules, assume allowed
       }
   }
 
@@ -242,7 +260,7 @@ async function auditPage(pageUrl: string, html: string, opts: any, robots?: any)
   const anchorScore = anchors.length ? (emptyAnchors === 0 ? 1 : emptyAnchors <= 2 ? 0.7 : 0.4) : 1;
   if (emptyAnchors) add({ id: 'empty-anchors', title: `Links with empty text (${emptyAnchors})`, severity: 'info', score: anchorScore, suggestion: 'Use descriptive, non-empty anchor text; avoid “click here.”', page: pageUrl });
 
-  // Broken Link Checker (Limited to first 20 to save time/bandwidth for now)
+  // Broken Link Checker (Limited to first 20 to save time/bandwidth)
   let brokenLinks = 0;
   if (opts.checkLinks) {
       const linksToCheck = Array.from(uniqueLinks).slice(0, 20);
@@ -360,6 +378,9 @@ function toMarkdown(report: Report): string {
 async function runAudit(target: string, opts: any) {
   const pages: string[] = [];
 
+  // Use fetch function based on render flag
+  const fetchFn = opts.render ? fetchRendered : fetchText;
+
   if (/^https?:\/\//i.test(target)) {
     if (!opts.crawl) {
       pages.push(target);
@@ -370,7 +391,7 @@ async function runAudit(target: string, opts: any) {
         const next = toVisit.shift()!;
         if (seen.has(next)) continue; seen.add(next);
         try {
-          const { status, text, finalUrl } = await fetchText(next, opts.timeout ?? 15000);
+          const { status, text, finalUrl } = await fetchFn(next, opts.timeout ?? 15000);
           if (status >= 200 && status < 400) {
             pages.push(finalUrl);
             const $ = cheerio.load(text);
@@ -378,10 +399,12 @@ async function runAudit(target: string, opts: any) {
             for (const l of links) if (!seen.has(l)) toVisit.push(l);
           }
         } catch {}
-        await sleep(50);
+        // Sleep a bit more if rendering to avoid hammering
+        await sleep(opts.render ? 500 : 50);
       }
     }
   } else {
+    // Local files - no rendering needed/possible really unless we spin up a server
     const p = resolve(process.cwd(), target);
     const st = statSync(p);
     if (st.isFile()) {
@@ -409,6 +432,7 @@ async function runAudit(target: string, opts: any) {
 
   if (/^https?:\/\//i.test(target)) {
     try {
+      // Robots/Sitemap check uses simple fetch, no need to render
       const r = await checkRobotsAndSitemap(target, opts.timeout ?? 15000);
       robotsOk = r.robotsOk; sitemapOk = r.sitemapOk; robotsEvidence = r.robotsEvidence; sitemapEvidence = r.sitemapEvidence;
       robotsParserInstance = r.robotsObj;
@@ -421,7 +445,10 @@ async function runAudit(target: string, opts: any) {
   for (const p of pages) {
     let html = pageContent.get(p);
     if (!html) {
-      try { const res = await fetchText(p, opts.timeout ?? 15000); html = res.text; } catch { html = ''; }
+      try { 
+          const res = await fetchFn(p, opts.timeout ?? (opts.render ? 30000 : 15000)); 
+          html = res.text; 
+      } catch { html = ''; }
     }
     const result = await auditPage(p, html || '', opts, robotsParserInstance);
     perPage.push(result);
@@ -515,6 +542,7 @@ program
   .option('--fail-under <score>', 'exit non-zero if score below', (v)=>parseInt(v,10), 0)
   .option('--timeout <ms>', 'request timeout', (v)=>parseInt(v,10), 15000)
   .option('--check-links', 'check for broken links (slow)', false)
+  .option('--render', 'render pages with JS (Playwright) - slower but accurate for SPAs', false)
   .action(async (target, opts) => {
     const resolved = resolveDefaultTarget(target);
     await runAudit(normalizeUrl(resolved), opts);
@@ -530,6 +558,7 @@ program.command('check')
   .option('--fail-under <score>', 'exit non-zero if score below', (v)=>parseInt(v,10), 0)
   .option('--timeout <ms>', 'request timeout', (v)=>parseInt(v,10), 15000)
   .option('--check-links', 'check for broken links (slow)', false)
+  .option('--render', 'render pages with JS (Playwright) - slower but accurate for SPAs', false)
   .action(async (target, opts) => {
     const resolved = resolveDefaultTarget(target);
     await runAudit(normalizeUrl(resolved), opts);
