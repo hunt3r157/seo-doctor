@@ -5,6 +5,10 @@ import { resolve, extname, join } from 'path';
 import * as cheerio from 'cheerio';
 import { request } from 'undici';
 import * as url from 'url';
+import robotsParser from 'robots-parser';
+import { chromium } from 'playwright';
+import lighthouse from 'lighthouse';
+import * as chromeLauncher from 'chrome-launcher';
 
 type Finding = {
   id: string;
@@ -16,7 +20,7 @@ type Finding = {
   page: string;
 };
 
-type CategoryId = 'discoverability' | 'semantics' | 'metadata' | 'i18n_mobile' | 'structured';
+type CategoryId = 'discoverability' | 'semantics' | 'metadata' | 'i18n_mobile' | 'structured' | 'performance';
 
 interface PageAuditResult {
   url: string;
@@ -34,14 +38,15 @@ interface Report {
 }
 
 const CATEGORY_WEIGHTS: Record<CategoryId, number> = {
-  discoverability: 0.25,
-  semantics: 0.25,
-  metadata: 0.25,
+  discoverability: 0.20,
+  semantics: 0.20,
+  metadata: 0.20,
   i18n_mobile: 0.15,
   structured: 0.10,
+  performance: 0.15,
 };
 
-const VERSION = '0.1.3';
+const VERSION = '0.4.0';
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
@@ -53,10 +58,112 @@ async function fetchText(target: string, timeoutMs = 15000): Promise<{ status: n
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await request(target, { method: 'GET', signal: controller.signal, headers: { 'user-agent': 'seo-doctor/0.1' } });
+    const res = await request(target, { method: 'GET', signal: controller.signal, headers: { 'user-agent': 'seo-doctor/0.4' } });
     const text = await res.body.text();
-    const finalUrl = target;
+    const finalUrl = target; 
     return { status: res.statusCode, text, finalUrl };
+  } catch (e) {
+    return { status: 0, text: '', finalUrl: target };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchRendered(target: string, timeoutMs = 30000): Promise<{ status: number; text: string; finalUrl: string }> {
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({ userAgent: 'seo-doctor/0.4 (Playwright)' });
+    const page = await context.newPage();
+    
+    const response = await page.goto(target, { timeout: timeoutMs, waitUntil: 'networkidle' });
+    const text = await page.content();
+    const status = response?.status() ?? 0;
+    const finalUrl = page.url();
+    
+    await browser.close();
+    return { status, text, finalUrl };
+  } catch (e) {
+    if (browser) await browser.close();
+    return { status: 0, text: '', finalUrl: target };
+  }
+}
+
+async function runLighthouse(url: string): Promise<{ score: number, findings: Finding[] }> {
+    let chrome;
+    try {
+        chrome = await chromeLauncher.launch({chromeFlags: ['--headless']});
+        const options = {logLevel: 'error', output: 'json', onlyCategories: ['performance'], port: chrome.port};
+        // @ts-ignore
+        const runnerResult = await lighthouse(url, options);
+        if (!runnerResult) throw new Error('Lighthouse failed');
+        const report = runnerResult.lhr;
+
+        const score = report.categories.performance.score || 0;
+        const findings: Finding[] = [];
+
+        // Extract Vitals
+        const lcp = report.audits['largest-contentful-paint'];
+        const cls = report.audits['cumulative-layout-shift'];
+        const inp = report.audits['interaction-to-next-paint']; // Lighthouse uses max-potential-fid or similar if INP not full field data, but we check what's avail
+
+        if (lcp && lcp.score !== null && lcp.score < 0.9) {
+             findings.push({ 
+                 id: 'lcp-poor', 
+                 title: `Poor LCP (${lcp.displayValue})`, 
+                 severity: lcp.score < 0.5 ? 'error' : 'warn', 
+                 score: lcp.score, 
+                 suggestion: 'Optimize Largest Contentful Paint (images, server response time).', 
+                 page: url,
+                 evidence: { value: lcp.numericValue }
+            });
+        }
+
+        if (cls && cls.score !== null && cls.score < 0.9) {
+            findings.push({ 
+                id: 'cls-poor', 
+                title: `Poor CLS (${cls.displayValue})`, 
+                severity: cls.score < 0.5 ? 'error' : 'warn', 
+                score: cls.score, 
+                suggestion: 'Reduce layout shifts (specify image dims, avoid top-injected content).', 
+                page: url,
+                evidence: { value: cls.numericValue }
+           });
+       }
+
+       return { score, findings };
+
+    } catch (e) {
+        if (chrome) await chrome.kill();
+        return { score: 0, findings: [{id: 'lighthouse-fail', title: 'Lighthouse failed to run', severity: 'info', score: 0, page: url, suggestion: 'Ensure Chrome is installed or retry.'}] };
+    } finally {
+        if (chrome) await chrome.kill();
+    }
+}
+
+async function checkLinkStatus(link: string, timeoutMs = 5000): Promise<number> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await request(link, { 
+      method: 'HEAD', 
+      signal: controller.signal, 
+      headers: { 'user-agent': 'seo-doctor/0.4' },
+      maxRedirections: 3
+    });
+    return res.statusCode;
+  } catch {
+    try {
+        const res = await request(link, { 
+            method: 'GET', 
+            signal: controller.signal, 
+            headers: { 'user-agent': 'seo-doctor/0.4' },
+            maxRedirections: 3
+          });
+          return res.statusCode;
+    } catch {
+        return 0;
+    }
   } finally {
     clearTimeout(timer);
   }
@@ -113,7 +220,7 @@ function resolveDefaultTarget(input?: string): string {
   return 'http://localhost:3000';
 }
 
-async function auditPage(pageUrl: string, html: string): Promise<PageAuditResult> {
+async function auditPage(pageUrl: string, html: string, opts: any, robots?: any): Promise<PageAuditResult> {
   const $ = cheerio.load(html);
   const findings: Finding[] = [];
   const add = (f: Finding) => findings.push(f);
@@ -156,6 +263,14 @@ async function auditPage(pageUrl: string, html: string): Promise<PageAuditResult
     }
   }
 
+  // Discoverability: robots.txt check (real parsing)
+  if (robots && /^https?:\/\//i.test(pageUrl)) {
+      const isAllowed = robots.isAllowed(pageUrl, 'seo-doctor'); // Use our UA or *
+      if (isAllowed === false) {
+          add({ id: 'blocked-by-robots', title: 'Blocked by robots.txt', severity: 'error', score: 0, suggestion: 'Update robots.txt to allow this URL if it should be indexed.', page: pageUrl });
+      }
+  }
+
   // I18n & mobile
   const lang = $('html').attr('lang');
   const viewport = $('meta[name="viewport"]').attr('content');
@@ -179,19 +294,46 @@ async function auditPage(pageUrl: string, html: string): Promise<PageAuditResult
   const imgAltScore = totalImgs ? (missingPct <= 0.1 ? 1 : missingPct <= 0.3 ? 0.6 : 0.2) : 1;
   if (missingAlt) add({ id: 'img-alt-missing', title: `Images missing alt (${Math.round(missingPct*100)}%)`, severity: missingPct > 0.3 ? 'warn' : 'info', score: imgAltScore, suggestion: `Add alt to ~${missingAlt}/${totalImgs} images (decorative images may use alt="").`, page: pageUrl });
 
-  // Semantics: anchor text quality
+  // Semantics: anchor text quality & broken links
   const anchors = $('a[href]');
   let emptyAnchors = 0;
-  anchors.each((_, el) => { const txt = $(el).text().trim(); if (!txt) emptyAnchors += 1; });
+  const uniqueLinks = new Set<string>();
+  
+  anchors.each((_, el) => { 
+      const txt = $(el).text().trim(); 
+      if (!txt) emptyAnchors += 1; 
+      
+      const href = $(el).attr('href');
+      if (href && !href.startsWith('#') && !href.startsWith('mailto:') && !href.startsWith('tel:')) {
+          try {
+             const abs = new url.URL(href, pageUrl).toString();
+             uniqueLinks.add(abs);
+          } catch {}
+      }
+  });
+
   const anchorScore = anchors.length ? (emptyAnchors === 0 ? 1 : emptyAnchors <= 2 ? 0.7 : 0.4) : 1;
   if (emptyAnchors) add({ id: 'empty-anchors', title: `Links with empty text (${emptyAnchors})`, severity: 'info', score: anchorScore, suggestion: 'Use descriptive, non-empty anchor text; avoid “click here.”', page: pageUrl });
+
+  // Broken Link Checker (Limited to first 20 to save time/bandwidth)
+  let brokenLinks = 0;
+  if (opts.checkLinks) {
+      const linksToCheck = Array.from(uniqueLinks).slice(0, 20);
+      for (const l of linksToCheck) {
+         const status = await checkLinkStatus(l);
+         if (status >= 400 || status === 0) {
+             brokenLinks++;
+             add({ id: 'broken-link', title: `Broken link found: ${status || 'Error'}`, severity: 'error', score: 0, suggestion: `Fix broken link: ${l}`, page: pageUrl, evidence: { url: l, status } });
+         }
+      }
+  }
 
   // Discoverability: noindex
   const robotsMeta = $('meta[name="robots"]').attr('content')?.toLowerCase() ?? '';
   const noindex = robotsMeta.includes('noindex');
   if (noindex) add({ id: 'noindex-set', title: 'noindex is set', severity: 'error', score: 0, suggestion: 'Remove noindex for pages that should appear in search.', page: pageUrl, evidence: { robots: robotsMeta } });
 
-  // Structured data: JSON-LD parse
+  // Structured data: JSON-LD parse & validate
   let structuredScore = 0;
   const jsonLdBlocks: any[] = [];
   $('script[type="application/ld+json"]').each((_, el) => {
@@ -201,8 +343,27 @@ async function auditPage(pageUrl: string, html: string): Promise<PageAuditResult
       jsonLdBlocks.push(parsed);
     } catch {}
   });
-  structuredScore = jsonLdBlocks.length ? 1 : 0;
+
+  // Schema Validation
+  let validSchemas = 0;
+  if (jsonLdBlocks.length > 0) {
+      for (const block of jsonLdBlocks) {
+          const context = block['@context'];
+          const type = block['@type'];
+          if (context && (context.includes('schema.org') || context.includes('google.com/schemas'))) {
+             if (type) validSchemas++;
+          }
+      }
+      structuredScore = validSchemas > 0 ? 1 : 0.5; // Has JSON but maybe invalid schema
+  }
+
   if (!jsonLdBlocks.length) add({ id: 'jsonld-missing', title: 'No JSON-LD structured data', severity: 'info', score: 0, suggestion: 'Add JSON-LD (Organization, WebSite; Article/BlogPosting for posts).', page: pageUrl });
+  else if (validSchemas === 0) add({ id: 'jsonld-invalid', title: 'Invalid JSON-LD Schema', severity: 'warn', score: 0.5, suggestion: 'Ensure @context is "https://schema.org" and @type is present.', page: pageUrl });
+
+  // Performance (Placeholder for standard audit, actual LH run happens in loop)
+  // We initialize performance score to 1 if not running LH, or 0 if we are and waiting for result
+  let perfScore = opts.lighthouse ? 0 : 1; 
+
 
   const cat: Record<CategoryId, number> = {
     metadata: Math.min(1, (titleScore + descScore + ogScore + (twitterCard ? 1 : 0)) / 4),
@@ -210,6 +371,7 @@ async function auditPage(pageUrl: string, html: string): Promise<PageAuditResult
     semantics: Math.min(1, (headingScore + imgAltScore + anchorScore) / 3),
     i18n_mobile: i18nScore,
     structured: structuredScore,
+    performance: perfScore
   };
 
   return { url: pageUrl, categoryScores: cat, findings };
@@ -218,12 +380,16 @@ async function auditPage(pageUrl: string, html: string): Promise<PageAuditResult
 async function checkRobotsAndSitemap(root: string, timeoutMs: number) {
   const origin = new url.URL(root).origin;
   let robotsOk = 0, sitemapOk = 0, robotsEvidence: any = {}, sitemapEvidence: any = {};
+  let robotsObj: any = null;
 
   try {
     const robotsUrl = origin + '/robots.txt';
     const r = await fetchText(robotsUrl, timeoutMs);
     robotsOk = r.status >= 200 && r.status < 400 ? 1 : 0;
     robotsEvidence = { url: robotsUrl, status: r.status };
+    if (robotsOk) {
+        robotsObj = robotsParser(robotsUrl, r.text);
+    }
   } catch { robotsOk = 0; }
 
   try {
@@ -233,7 +399,7 @@ async function checkRobotsAndSitemap(root: string, timeoutMs: number) {
     sitemapEvidence = { url: smUrl, status: s.status };
   } catch { sitemapOk = 0; }
 
-  return { robotsOk, sitemapOk, robotsEvidence, sitemapEvidence };
+  return { robotsOk, sitemapOk, robotsEvidence, sitemapEvidence, robotsObj };
 }
 
 function toMarkdown(report: Report): string {
@@ -250,7 +416,8 @@ function toMarkdown(report: Report): string {
     semantics: 'On-page semantics',
     metadata: 'Metadata',
     i18n_mobile: 'Internationalization & Mobile',
-    structured: 'Structured data'
+    structured: 'Structured data',
+    performance: 'Performance (Core Web Vitals)'
   };
   (Object.keys(report.categories) as CategoryId[]).forEach((k) => {
     const c = report.categories[k];
@@ -272,6 +439,9 @@ function toMarkdown(report: Report): string {
 async function runAudit(target: string, opts: any) {
   const pages: string[] = [];
 
+  // Use fetch function based on render flag
+  const fetchFn = opts.render ? fetchRendered : fetchText;
+
   if (/^https?:\/\//i.test(target)) {
     if (!opts.crawl) {
       pages.push(target);
@@ -282,7 +452,7 @@ async function runAudit(target: string, opts: any) {
         const next = toVisit.shift()!;
         if (seen.has(next)) continue; seen.add(next);
         try {
-          const { status, text, finalUrl } = await fetchText(next, opts.timeout ?? 15000);
+          const { status, text, finalUrl } = await fetchFn(next, opts.timeout ?? 15000);
           if (status >= 200 && status < 400) {
             pages.push(finalUrl);
             const $ = cheerio.load(text);
@@ -290,10 +460,12 @@ async function runAudit(target: string, opts: any) {
             for (const l of links) if (!seen.has(l)) toVisit.push(l);
           }
         } catch {}
-        await sleep(50);
+        // Sleep a bit more if rendering to avoid hammering
+        await sleep(opts.render ? 500 : 50);
       }
     }
   } else {
+    // Local files - no rendering needed/possible really unless we spin up a server
     const p = resolve(process.cwd(), target);
     const st = statSync(p);
     if (st.isFile()) {
@@ -317,10 +489,14 @@ async function runAudit(target: string, opts: any) {
   }
 
   let robotsOk = 1, sitemapOk = 1, robotsEvidence: any = {}, sitemapEvidence: any = {};
+  let robotsParserInstance: any = null;
+
   if (/^https?:\/\//i.test(target)) {
     try {
+      // Robots/Sitemap check uses simple fetch, no need to render
       const r = await checkRobotsAndSitemap(target, opts.timeout ?? 15000);
       robotsOk = r.robotsOk; sitemapOk = r.sitemapOk; robotsEvidence = r.robotsEvidence; sitemapEvidence = r.sitemapEvidence;
+      robotsParserInstance = r.robotsObj;
     } catch {}
   }
 
@@ -330,16 +506,33 @@ async function runAudit(target: string, opts: any) {
   for (const p of pages) {
     let html = pageContent.get(p);
     if (!html) {
-      try { const res = await fetchText(p, opts.timeout ?? 15000); html = res.text; } catch { html = ''; }
+      try { 
+          const res = await fetchFn(p, opts.timeout ?? (opts.render ? 30000 : 15000)); 
+          html = res.text; 
+      } catch { html = ''; }
     }
-    const result = await auditPage(p, html || '');
+    const result = await auditPage(p, html || '', opts, robotsParserInstance);
+
+    // Run Lighthouse if requested (only on the first page to save time/resources for now, or per page if robust)
+    // For MVP CLI, running full lighthouse on every page of a crawl is too slow. Let's do it for the *first* page (target).
+    if (opts.lighthouse && p === pages[0] && /^https?:\/\//i.test(p)) {
+        console.log('Running Lighthouse audit on ' + p + '...');
+        const lh = await runLighthouse(p);
+        result.categoryScores.performance = lh.score;
+        result.findings.push(...lh.findings);
+    } else if (opts.lighthouse) {
+         // inherit score from first page or set to 1 (neutral) for subpages to avoid skewing if we only checked one
+         // simpler: just default to 1 if not checked
+         result.categoryScores.performance = 1;
+    }
+
     perPage.push(result);
     findings.push(...result.findings);
   }
 
-  const sumCat: Record<CategoryId, number> = { discoverability: 0, semantics: 0, metadata: 0, i18n_mobile: 0, structured: 0 };
+  const sumCat: Record<CategoryId, number> = { discoverability: 0, semantics: 0, metadata: 0, i18n_mobile: 0, structured: 0, performance: 0 };
   for (const r of perPage) for (const k of Object.keys(sumCat) as CategoryId[]) sumCat[k] += r.categoryScores[k];
-  const avgCat: Record<CategoryId, number> = { discoverability: 0, semantics: 0, metadata: 0, i18n_mobile: 0, structured: 0 };
+  const avgCat: Record<CategoryId, number> = { discoverability: 0, semantics: 0, metadata: 0, i18n_mobile: 0, structured: 0, performance: 0 };
   for (const k of Object.keys(sumCat) as CategoryId[]) avgCat[k] = sumCat[k] / perPage.length;
 
   if (/^https?:\/\//i.test(target)) {
@@ -354,6 +547,7 @@ async function runAudit(target: string, opts: any) {
     metadata: { score: round2(avgCat.metadata), weight: CATEGORY_WEIGHTS.metadata },
     i18n_mobile: { score: round2(avgCat.i18n_mobile), weight: CATEGORY_WEIGHTS.i18n_mobile },
     structured: { score: round2(avgCat.structured), weight: CATEGORY_WEIGHTS.structured },
+    performance: { score: round2(avgCat.performance), weight: CATEGORY_WEIGHTS.performance },
   };
 
   const overall = round0(100 * (
@@ -361,7 +555,8 @@ async function runAudit(target: string, opts: any) {
     categories.semantics.score * categories.semantics.weight +
     categories.metadata.score * categories.metadata.weight +
     categories.i18n_mobile.score * categories.i18n_mobile.weight +
-    categories.structured.score * categories.structured.weight
+    categories.structured.score * categories.structured.weight +
+    categories.performance.score * categories.performance.weight
   ));
 
   const report: Report = {
@@ -383,6 +578,7 @@ async function runAudit(target: string, opts: any) {
     ['metadata', 'Metadata'],
     ['i18n_mobile', 'I18n & Mobile'],
     ['structured', 'Structured data'],
+    ['performance', 'Performance (Core Web Vitals)'],
   ];
   for (const [id, label] of order) {
     const c = report.categories[id];
@@ -423,6 +619,9 @@ program
   .option('--md <file>', 'write Markdown report')
   .option('--fail-under <score>', 'exit non-zero if score below', (v)=>parseInt(v,10), 0)
   .option('--timeout <ms>', 'request timeout', (v)=>parseInt(v,10), 15000)
+  .option('--check-links', 'check for broken links (slow)', false)
+  .option('--render', 'render pages with JS (Playwright) - slower but accurate for SPAs', false)
+  .option('--lighthouse', 'run Lighthouse for Core Web Vitals (slow, requires Chrome)', false)
   .action(async (target, opts) => {
     const resolved = resolveDefaultTarget(target);
     await runAudit(normalizeUrl(resolved), opts);
@@ -437,6 +636,9 @@ program.command('check')
   .option('--md <file>', 'write Markdown report')
   .option('--fail-under <score>', 'exit non-zero if score below', (v)=>parseInt(v,10), 0)
   .option('--timeout <ms>', 'request timeout', (v)=>parseInt(v,10), 15000)
+  .option('--check-links', 'check for broken links (slow)', false)
+  .option('--render', 'render pages with JS (Playwright) - slower but accurate for SPAs', false)
+  .option('--lighthouse', 'run Lighthouse for Core Web Vitals (slow, requires Chrome)', false)
   .action(async (target, opts) => {
     const resolved = resolveDefaultTarget(target);
     await runAudit(normalizeUrl(resolved), opts);
